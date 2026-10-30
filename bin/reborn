@@ -1,0 +1,121 @@
+#!/bin/sh
+# reborn: bring Claude Code background sessions back after a reboot.
+set -eu
+
+VERSION=0.1.0
+CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+ROSTER=${REBORN_ROSTER:-$CONFIG_DIR/daemon/roster.json}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/reborn
+CLAUDE=${REBORN_CLAUDE:-claude}
+LABEL=local.reborn
+PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
+LOG=$HOME/Library/Logs/reborn.log
+
+die() { printf 'reborn: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+usage: reborn restore [--dry-run]   resume the background sessions a reboot left behind
+       reborn install               run 'reborn restore' at every login (macOS)
+       reborn uninstall             remove the login item
+EOF
+}
+
+squeeze() { awk '{$1=$1; print}'; }
+
+# A pid alone proves nothing after a reboot, because pids get reused,
+# so a worker only counts as running if its start time matches too.
+# Claude records that time in UTC; local time is accepted as well.
+running() {
+  want=$(printf '%s\n' "$2" | squeeze)
+  utc=$(TZ=UTC LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | squeeze)
+  here=$(LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | squeeze)
+  [ -n "$want" ] && [ -n "$utc" ] && { [ "$utc" = "$want" ] || [ "$here" = "$want" ]; }
+}
+
+restore() {
+  dry=
+  [ "${1:-}" = --dry-run ] && dry=1
+  command -v jq >/dev/null 2>&1 || die "jq is required"
+  echo "reborn restore $(date '+%Y-%m-%d %H:%M:%S')"
+  [ -f "$ROSTER" ] || { echo "no roster at $ROSTER, nothing to restore"; return 0; }
+
+  # Read every worker before resuming any: the first 'claude --bg' starts
+  # Claude's background service, which clears dead workers from the roster.
+  workers=$(jq -r '(.workers // {})[]
+    | select(.sessionId and .cwd)
+    | [(.pid // 0), (.procStart // ""), .cwd, .sessionId] + (.dispatch.respawnFlags // [])
+    | @sh' "$ROSTER") || die "cannot read $ROSTER"
+  [ -n "$workers" ] || { echo "roster is empty, nothing to restore"; return 0; }
+
+  [ -n "$dry" ] || { mkdir -p "$STATE_DIR" && cp "$ROSTER" "$STATE_DIR/last-roster.json"; }
+
+  printf '%s\n' "$workers" | while IFS= read -r line; do
+    eval "set -- $line"
+    pid=$1 started=$2 dir=$3 session=$4
+    shift 4
+    if running "$pid" "$started"; then
+      echo "running   $session  $dir"
+    elif [ ! -d "$dir" ]; then
+      echo "skipped   $session  $dir (folder no longer exists)"
+    elif [ -n "$dry" ]; then
+      echo "would resume  $session  $dir"
+    else
+      out=$(cd "$dir" && "$CLAUDE" --bg --resume "$session" "$@" 2>&1) || true
+      if printf '%s\n' "$out" | grep -q 'backgrounded'; then
+        echo "resumed   $session  $dir"
+      else
+        echo "failed    $session  $dir: $(printf '%s\n' "$out" | grep -v 'Starting background service' | head -1)"
+      fi
+    fi
+  done
+}
+
+install_agent() {
+  [ "$(uname)" = Darwin ] || die "install only supports macOS so far"
+  self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+  shell=${SHELL:-/bin/zsh}
+  mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
+  # Run through an interactive login shell so the background service, and every
+  # session it starts, gets the same environment as a terminal.
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$shell</string>
+    <string>-lic</string>
+    <string>exec '$self' restore</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$LOG</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$PLIST" >/dev/null || die "wrote an invalid $PLIST"
+  echo "installed $PLIST"
+  echo "reborn restore will run at every login; log: $LOG"
+}
+
+uninstall_agent() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+  echo "removed $PLIST"
+}
+
+case ${1:-} in
+  restore) shift; restore "$@" ;;
+  install) install_agent ;;
+  uninstall) uninstall_agent ;;
+  --version) echo "reborn $VERSION" ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
