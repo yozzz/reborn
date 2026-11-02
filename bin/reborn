@@ -2,7 +2,7 @@
 # reborn: reopen your Claude Code tabs after a restart.
 set -eu
 
-VERSION=0.3.0
+VERSION=0.3.1
 CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 ROSTER=$CONFIG_DIR/daemon/roster.json
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/reborn
@@ -95,31 +95,79 @@ status() {
   awk 'BEGIN { FS = "\t" } { printf "  %s  %-34s %s\n", $4, ($6 == "" ? "-" : $6), $5 }' "$OPEN" | sed "s#$HOME#~#"
 }
 
-# Arguments are folder/command pairs: one tab each, in the current iTerm window
-# (or a new one if none is open).
+# The tty of every iTerm tab, in window and tab order. Starts iTerm if needed
+# and gives it a moment to restore its own windows.
+iterm_ttys() {
+  osascript <<'APPLESCRIPT'
+set wasRunning to application "iTerm" is running
+tell application "iTerm"
+  activate
+  if not wasRunning then delay 3
+  set out to ""
+  repeat with w in windows
+    repeat with t in tabs of w
+      set out to out & (tty of current session of t) & linefeed
+    end repeat
+  end repeat
+  return out
+end tell
+APPLESCRIPT
+}
+
+# Tabs with nothing but a shell in them, such as the empty ones iTerm
+# restores after a restart.
+idle_ttys() {
+  iterm_ttys | while IFS= read -r tty; do
+    [ -n "$tty" ] || continue
+    busy=$(ps -t "${tty#/dev/}" -o comm= 2>/dev/null | grep -cvE '(^|/)-?(zsh|bash|sh|fish|login)$' || true)
+    [ "$busy" -eq 0 ] && echo "$tty"
+  done
+}
+
+# Arguments are folder/command pairs. Each goes into an empty tab while there
+# are any, then into new tabs in the current iTerm window (or a new window).
 open_tabs() {
+  idle=$(idle_ttys)
+  pairs=$(($# / 2))
+  i=0
+  while [ "$i" -lt "$pairs" ]; do
+    dir=$1 cmd=$2
+    shift 2
+    set -- "$@" "$(printf '%s\n' "$idle" | sed -n "$((i + 1))p")" "$dir" "$cmd"
+    i=$((i + 1))
+  done
   osascript - "$@" >/dev/null <<'APPLESCRIPT' \
     || die "could not open iTerm tabs; allow control of iTerm in System Settings > Privacy & Security > Automation, then run 'reborn restore'"
 on run argv
-  set wasRunning to application "iTerm" is running
   tell application "iTerm"
     activate
-    if not wasRunning then delay 2
-    if (count of windows) is 0 then
-      set w to (create window with default profile)
-      set useFirstTab to true
-    else
-      set w to current window
-      set useFirstTab to false
-    end if
-    repeat with k from 1 to (count of argv) by 2
-      if k > 1 or not useFirstTab then tell w to create tab with default profile
-      tell current session of w to write text "cd " & quoted form of (item k of argv) & " && " & (item (k + 1) of argv)
+    repeat with k from 1 to (count of argv) by 3
+      set target to item k of argv
+      set s to missing value
+      if target is not "" then
+        repeat with w in windows
+          repeat with t in tabs of w
+            if tty of current session of t is target then set s to current session of t
+          end repeat
+        end repeat
+      end if
+      if s is missing value then
+        if (count of windows) is 0 then
+          set w to (create window with default profile)
+        else
+          set w to current window
+          tell w to create tab with default profile
+        end if
+        set s to current session of w
+      end if
+      tell s to write text "cd " & quoted form of (item (k + 1) of argv) & " && " & (item (k + 2) of argv)
     end repeat
   end tell
 end run
 APPLESCRIPT
-  echo "opened $(($# / 2)) tab(s) in iTerm"
+  reused=$(printf '%s\n' "$idle" | grep -c . || true)
+  [ "$reused" -gt "$pairs" ] && reused=$pairs
+  echo "opened $pairs tab(s) in iTerm, $reused of them in empty tabs"
 }
 
 restore() {

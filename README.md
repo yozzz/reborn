@@ -26,7 +26,7 @@ Needs macOS, iTerm, `jq` (built into recent macOS) and Claude Code (tested with 
 
 ## How it works
 
-Claude Code keeps a live list of its running sessions in `~/.claude/sessions/`. Every minute reborn copies the ones running in a terminal to `~/.local/state/reborn/open-tabs.tsv`. A session that disappears stays on the list for about 2½ minutes, because a shutdown closes every tab at once and the list has to survive that. At login, reborn opens an iTerm tab for each session from before the restart and runs `claude --resume <id>` in its folder.
+Claude Code keeps a live list of its running sessions in `~/.claude/sessions/`. Every minute reborn copies the ones running in a terminal to `~/.local/state/reborn/open-tabs.tsv`. A session that disappears stays on the list for about 2½ minutes, because a shutdown closes every tab at once and the list has to survive that. At login, reborn runs `claude --resume <id>` in its folder for each session from before the restart. It uses the empty tabs iTerm restores on its own first, and opens new tabs only when there aren't enough.
 
 Tabs showing a background session with `claude attach <id>` are remembered too, and come back with `claude attach`.
 
