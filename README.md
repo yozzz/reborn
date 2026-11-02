@@ -36,3 +36,7 @@ Tabs showing a background session with `claude attach <id>` are remembered too, 
 - **Timing.** A tab closed in the last ~2 minutes before a restart may come back; one opened in the last minute may not.
 - **The agent view isn't tracked.** Claude doesn't record which session a `claude agents` tab is showing, so those tabs don't come back. For a background session you want kept, use `claude attach <id>`.
 - **Tabs need permission.** The first time, macOS asks whether reborn may control iTerm. At login the request may be shown as `zsh` or `osascript`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
