@@ -2,7 +2,7 @@
 # reborn: bring Claude Code background sessions back after a reboot.
 set -eu
 
-VERSION=0.1.0
+VERSION=0.2.0
 CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 ROSTER=${REBORN_ROSTER:-$CONFIG_DIR/daemon/roster.json}
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/reborn
@@ -15,9 +15,10 @@ die() { printf 'reborn: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-usage: reborn restore [--dry-run]   resume the background sessions a reboot left behind
-       reborn install               run 'reborn restore' at every login (macOS)
-       reborn uninstall             remove the login item
+usage: reborn restore [--dry-run] [--tabs]   resume the background sessions a reboot left behind
+       reborn tabs [id...]                   open each running background session in an iTerm tab
+       reborn install [--tabs]               run 'reborn restore' at every login (macOS)
+       reborn uninstall                      remove the login item
 EOF
 }
 
@@ -71,8 +72,48 @@ restore() {
   done
 }
 
+# One tab per session, each attached to it, in the current iTerm window (or a
+# new one if none is open). The tabs start from a normal shell, so detaching
+# leaves you in the session's folder.
+open_tabs() {
+  [ "$(uname)" = Darwin ] || die "tabs needs macOS and iTerm"
+  sessions=$("$CLAUDE" agents --json 2>/dev/null | jq -r --arg want "$*" '.[]
+    | select(.kind == "background")
+    | select($want == "" or (.id as $i | $want | split(" ") | index($i)))
+    | .cwd, .id') || die "cannot list sessions"
+  [ -n "$sessions" ] || { echo "no background sessions to open"; return 0; }
+  old_ifs=$IFS; IFS='
+'
+  set -f; set -- $sessions; set +f
+  IFS=$old_ifs
+  osascript - "$@" >/dev/null <<'APPLESCRIPT' \
+    || die "could not open iTerm tabs; allow control of iTerm in System Settings > Privacy & Security > Automation, then run 'reborn tabs'"
+on run argv
+  set wasRunning to application "iTerm" is running
+  tell application "iTerm"
+    activate
+    if not wasRunning then delay 2
+    if (count of windows) is 0 then
+      set w to (create window with default profile)
+      set useFirstTab to true
+    else
+      set w to current window
+      set useFirstTab to false
+    end if
+    repeat with k from 1 to (count of argv) by 2
+      if k > 1 or not useFirstTab then tell w to create tab with default profile
+      tell current session of w to write text "cd " & quoted form of (item k of argv) & " && claude attach " & (item (k + 1) of argv)
+    end repeat
+  end tell
+end run
+APPLESCRIPT
+  echo "opened $(($# / 2)) tab(s) in iTerm"
+}
+
 install_agent() {
   [ "$(uname)" = Darwin ] || die "install only supports macOS so far"
+  cmd=restore
+  [ "${1:-}" = --tabs ] && cmd="restore --tabs"
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   shell=${SHELL:-/bin/zsh}
   mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
@@ -89,7 +130,7 @@ install_agent() {
   <array>
     <string>$shell</string>
     <string>-lic</string>
-    <string>exec '$self' restore</string>
+    <string>exec '$self' $cmd</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -102,7 +143,7 @@ install_agent() {
 EOF
   plutil -lint "$PLIST" >/dev/null || die "wrote an invalid $PLIST"
   echo "installed $PLIST"
-  echo "reborn restore will run at every login; log: $LOG"
+  echo "reborn $cmd will run at every login; log: $LOG"
 }
 
 uninstall_agent() {
@@ -112,8 +153,19 @@ uninstall_agent() {
 }
 
 case ${1:-} in
-  restore) shift; restore "$@" ;;
-  install) install_agent ;;
+  restore)
+    shift; dry= tabs=
+    for arg in "$@"; do
+      case $arg in
+        --dry-run) dry=1 ;;
+        --tabs) tabs=1 ;;
+        *) usage >&2; exit 2 ;;
+      esac
+    done
+    restore ${dry:+--dry-run}
+    if [ -n "$tabs" ] && [ -z "$dry" ]; then sleep 2; open_tabs; fi ;;
+  tabs) shift; open_tabs "$@" ;;
+  install) shift; install_agent "$@" ;;
   uninstall) uninstall_agent ;;
   --version) echo "reborn $VERSION" ;;
   -h|--help|help) usage ;;

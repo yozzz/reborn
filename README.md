@@ -10,9 +10,10 @@ Claude Code can run sessions in the background (`claude --bg`) and keeps a list 
 git clone https://github.com/yozzz/reborn ~/reborn
 ln -s ~/reborn/bin/reborn ~/.local/bin/reborn   # any directory on your PATH
 reborn install                                  # resume sessions at every login
+# or: reborn install --tabs                     # ...and reopen each one as an iTerm tab
 ```
 
-Needs macOS, `jq` (built into recent macOS), and Claude Code with background sessions (tested with 2.1.314).
+Needs macOS, `jq` (built into recent macOS), and Claude Code with background sessions (tested with 2.1.316). Tabs need iTerm.
 
 ## Start sessions in the background
 
@@ -37,7 +38,9 @@ echo 'source ~/reborn/shell/claude.zsh' >> ~/.zshrc
 |---|---|
 | `reborn restore` | resume every session the roster lists that isn't running |
 | `reborn restore --dry-run` | show what would be resumed |
-| `reborn install` | add a login item that runs `reborn restore` (log: `~/Library/Logs/reborn.log`) |
+| `reborn restore --tabs` | resume, then open each session in an iTerm tab |
+| `reborn tabs [id...]` | open every running background session, or just the ones given, as tabs in the current iTerm window |
+| `reborn install [--tabs]` | add a login item that runs `reborn restore`, or `reborn restore --tabs` (log: `~/Library/Logs/reborn.log`) |
 | `reborn uninstall` | remove the login item |
 
 ## Limits
@@ -46,4 +49,5 @@ echo 'source ~/reborn/shell/claude.zsh' >> ~/.zshrc
 - **Restore has to run first.** If you start a background session after a reboot before reborn runs, the list is gone. The conversations aren't: `claude --resume` still finds them.
 - **Untrusted folders are skipped.** Claude won't start a background session in a folder you haven't trusted. reborn logs it and moves on. Watch for new git repos: running `git init` inside a trusted folder makes the new repo untrusted, because Claude trusts each repo separately.
 - **Plain `claude` sessions aren't tracked** by Claude, so they can't be brought back. Use the shell function above.
+- **Tabs need permission.** The first time, macOS asks whether reborn may control iTerm. At login the request comes from the login item, so it may be shown as `zsh` or `osascript`. `reborn tabs` opens every running background session, including ones you already have open.
 - **Environment.** The login item runs your login shell (`$SHELL -lic`), so resumed sessions get the same environment as a terminal.
