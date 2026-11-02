@@ -1,31 +1,38 @@
 #!/bin/sh
-# reborn: bring Claude Code background sessions back after a reboot.
+# reborn: reopen your Claude Code tabs after a restart.
 set -eu
 
-VERSION=0.2.1
+VERSION=0.3.0
 CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
-ROSTER=${REBORN_ROSTER:-$CONFIG_DIR/daemon/roster.json}
+ROSTER=$CONFIG_DIR/daemon/roster.json
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/reborn
+OPEN=$STATE_DIR/open-tabs.tsv
 CLAUDE=${REBORN_CLAUDE:-claude}
 LABEL=local.reborn
-PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
+SNAP_LABEL=local.reborn.snapshot
+AGENTS=$HOME/Library/LaunchAgents
 LOG=$HOME/Library/Logs/reborn.log
+# A session that disappears stays remembered this long: a shutdown closes every
+# tab at once, and the list has to survive that.
+KEEP_SECONDS=150
+TAB=$(printf '\t')
 
 die() { printf 'reborn: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-usage: reborn restore [--dry-run] [--tabs]   resume the background sessions a reboot left behind
-       reborn tabs [id...]                   open each running background session in an iTerm tab
-       reborn install [--tabs]               run 'reborn restore' at every login (macOS)
-       reborn uninstall                      remove the login item
+usage: reborn status      show the Claude tabs that would come back after a restart
+       reborn restore     reopen them in iTerm (runs at login)
+       reborn snapshot    remember which Claude tabs are open (runs every minute)
+       reborn install     set up both login items (macOS)
+       reborn uninstall   remove them
 EOF
 }
 
 squeeze() { awk '{$1=$1; print}'; }
 
 # A pid alone proves nothing after a reboot, because pids get reused,
-# so a worker only counts as running if its start time matches too.
+# so a process only counts as running if its start time matches too.
 # Claude records that time in UTC; local time is accepted as well.
 running() {
   want=$(printf '%s\n' "$2" | squeeze)
@@ -34,77 +41,65 @@ running() {
   [ -n "$want" ] && [ -n "$utc" ] && { [ "$utc" = "$want" ] || [ "$here" = "$want" ]; }
 }
 
+boot_time() {
+  if [ -n "${REBORN_BOOT_TIME:-}" ]; then echo "$REBORN_BOOT_TIME"; return; fi
+  sysctl -n kern.boottime | sed -E 's/^\{ sec = ([0-9]+),.*/\1/'
+}
+
 service_running() {
   [ -f "$CONFIG_DIR/daemon.status.json" ] || return 1
   eval "set -- $(jq -r '[(.supervisorPid // 0), (.supervisorProcStart // "")] | @sh' "$CONFIG_DIR/daemon.status.json")"
   running "$1" "$2"
 }
 
-restore() {
-  dry=
-  [ "${1:-}" = --dry-run ] && dry=1
-  command -v jq >/dev/null 2>&1 || die "jq is required"
-  echo "reborn restore $(date '+%Y-%m-%d %H:%M:%S')"
-  [ -f "$ROSTER" ] || { echo "no roster at $ROSTER, nothing to restore"; return 0; }
-
-  # Read every worker before resuming any: the first 'claude --bg' starts
-  # Claude's background service, which clears dead workers from the roster.
-  workers=$(jq -r '(.workers // {})[]
-    | select(.sessionId and .cwd)
-    | [(.pid // 0), (.procStart // ""), .cwd, .sessionId] + (.dispatch.respawnFlags // [])
-    | @sh' "$ROSTER") || die "cannot read $ROSTER"
-  [ -n "$workers" ] || { echo "roster is empty, nothing to restore"; return 0; }
-
-  [ -n "$dry" ] || { mkdir -p "$STATE_DIR" && cp "$ROSTER" "$STATE_DIR/last-roster.json"; }
-
-  # Start Claude's background service before resuming anything. A service that
-  # starts because of a resume still lists that session's dead worker for a
-  # moment, and resumes it as a copy instead. With nothing running yet,
-  # respawn has nothing to restart; it only starts the service.
-  if [ -z "$dry" ] && ! service_running; then
-    "$CLAUDE" respawn --all </dev/null >/dev/null 2>&1 || true
-  fi
-
-  printf '%s\n' "$workers" | while IFS= read -r line; do
+# One line per Claude session open in a terminal right now:
+# kind, session id, short id, folder, name.
+current_sessions() {
+  for f in "$CONFIG_DIR"/sessions/*.json; do
+    [ -f "$f" ] || continue
+    jq -r 'select(.kind == "interactive" and (.entrypoint // "cli") == "cli")
+      | [(.pid // 0), (.procStart // ""), .sessionId, .cwd, (.name // "")] | @sh' "$f" </dev/null 2>/dev/null || true
+  done | while IFS= read -r line; do
     eval "set -- $line"
-    pid=$1 started=$2 dir=$3 session=$4
-    shift 4
-    if running "$pid" "$started"; then
-      echo "running   $session  $dir"
-    elif [ ! -d "$dir" ]; then
-      echo "skipped   $session  $dir (folder no longer exists)"
-    elif [ -n "$dry" ]; then
-      echo "would resume  $session  $dir"
-    else
-      # </dev/null: claude must not read the rest of the session list.
-      out=$(cd "$dir" && "$CLAUDE" --bg --resume "$session" "$@" </dev/null 2>&1) || true
-      if printf '%s\n' "$out" | grep -qi 'copy'; then
-        echo "copied    $session  $dir: $(printf '%s\n' "$out" | grep -i 'copy' | head -1)"
-      elif printf '%s\n' "$out" | grep -q 'backgrounded'; then
-        echo "resumed   $session  $dir"
-      else
-        echo "failed    $session  $dir: $(printf '%s\n' "$out" | grep -v 'Starting background service' | head -1)"
-      fi
+    if running "$1" "$2"; then
+      printf 'resume\t%s\t%s\t%s\t%s\n' "$3" "$(printf '%s' "$3" | cut -c1-8)" "$4" "$5"
     fi
+  done
+  # Tabs showing a background session through `claude attach <id>`.
+  [ -f "$ROSTER" ] || return 0
+  ps -axo command= | sed -n 's/.*claude attach \([0-9a-f]\{8\}\).*/\1/p' | sort -u | while IFS= read -r id; do
+    name=$(jq -r '.name // empty' "$CONFIG_DIR/jobs/$id/state.json" </dev/null 2>/dev/null || true)
+    jq -r --arg id "$id" --arg name "$name" \
+      '.workers[$id] // empty | ["attach", .sessionId, $id, .cwd, $name] | @tsv' "$ROSTER" </dev/null
   done
 }
 
-# One tab per session, each attached to it, in the current iTerm window (or a
-# new one if none is open). The tabs start from a normal shell, so detaching
-# leaves you in the session's folder.
+# The list is: last seen, kind, session id, short id, folder, name.
+snapshot() {
+  mkdir -p "$STATE_DIR"
+  now=$(date +%s)
+  boot=$(boot_time)
+  tmp=$(mktemp "$STATE_DIR/.open.XXXXXX")
+  {
+    current_sessions | awk -v now="$now" 'BEGIN { FS = OFS = "\t" } { print now, $0 }'
+    [ -f "$OPEN" ] && cat "$OPEN"
+  } | awk -v now="$now" -v boot="$boot" -v keep="$KEEP_SECONDS" 'BEGIN { FS = OFS = "\t" }
+    seen[$3]++ { next }
+    $1 == now || $1 < boot || now - $1 < keep' > "$tmp"
+  mv "$tmp" "$OPEN"
+}
+
+status() {
+  [ -s "$OPEN" ] || { echo "no Claude tabs remembered yet"; return 0; }
+  echo "after a restart, these tabs come back:"
+  awk 'BEGIN { FS = "\t" } { printf "  %s  %-34s %s\n", $4, ($6 == "" ? "-" : $6), $5 }' "$OPEN" | sed "s#$HOME#~#"
+}
+
+# Arguments are folder/command pairs: one tab each, in the current iTerm window
+# (or a new one if none is open).
 open_tabs() {
-  [ "$(uname)" = Darwin ] || die "tabs needs macOS and iTerm"
-  sessions=$("$CLAUDE" agents --json 2>/dev/null | jq -r --arg want "$*" '.[]
-    | select(.kind == "background")
-    | select($want == "" or (.id as $i | $want | split(" ") | index($i)))
-    | .cwd, .id') || die "cannot list sessions"
-  [ -n "$sessions" ] || { echo "no background sessions to open"; return 0; }
-  old_ifs=$IFS; IFS='
-'
-  set -f; set -- $sessions; set +f
-  IFS=$old_ifs
   osascript - "$@" >/dev/null <<'APPLESCRIPT' \
-    || die "could not open iTerm tabs; allow control of iTerm in System Settings > Privacy & Security > Automation, then run 'reborn tabs'"
+    || die "could not open iTerm tabs; allow control of iTerm in System Settings > Privacy & Security > Automation, then run 'reborn restore'"
 on run argv
   set wasRunning to application "iTerm" is running
   tell application "iTerm"
@@ -119,7 +114,7 @@ on run argv
     end if
     repeat with k from 1 to (count of argv) by 2
       if k > 1 or not useFirstTab then tell w to create tab with default profile
-      tell current session of w to write text "cd " & quoted form of (item k of argv) & " && claude attach " & (item (k + 1) of argv)
+      tell current session of w to write text "cd " & quoted form of (item k of argv) & " && " & (item (k + 1) of argv)
     end repeat
   end tell
 end run
@@ -127,16 +122,55 @@ APPLESCRIPT
   echo "opened $(($# / 2)) tab(s) in iTerm"
 }
 
+restore() {
+  echo "reborn restore $(date '+%Y-%m-%d %H:%M:%S')"
+  [ -s "$OPEN" ] || { echo "no remembered tabs"; return 0; }
+  boot=$(boot_time)
+  todo=$(awk -v boot="$boot" 'BEGIN { FS = "\t" } $1 < boot' "$OPEN")
+  [ -n "$todo" ] || { echo "nothing was open before this restart"; return 0; }
+  open_now=$(current_sessions | cut -f2)
+  set --
+  attach=
+  while IFS="$TAB" read -r _seen kind session short dir _name; do
+    if printf '%s\n' "$open_now" | grep -qx "$session"; then
+      echo "open      $short  $dir"
+    elif [ ! -d "$dir" ]; then
+      echo "skipped   $short  $dir (folder no longer exists)"
+    elif [ "$kind" = attach ]; then
+      set -- "$@" "$dir" "claude attach $short"
+      attach=1
+      echo "reopening $short  $dir"
+    else
+      set -- "$@" "$dir" "claude --resume $session"
+      echo "reopening $short  $dir"
+    fi
+  done <<EOF
+$todo
+EOF
+  if [ $# -gt 0 ]; then
+    # Attaching revives a background session. Start Claude's background service
+    # first, so it has cleared the dead sessions and doesn't resume copies.
+    if [ -n "$attach" ] && ! service_running; then
+      "$CLAUDE" respawn --all </dev/null >/dev/null 2>&1 || true
+    fi
+    open_tabs "$@"
+  fi
+  # Handled; from here on the snapshot tracks what's open again.
+  cp "$OPEN" "$STATE_DIR/last-restore.tsv"
+  tmp=$(mktemp "$STATE_DIR/.open.XXXXXX")
+  awk -v boot="$boot" 'BEGIN { FS = OFS = "\t" } $1 >= boot' "$OPEN" > "$tmp"
+  mv "$tmp" "$OPEN"
+}
+
 install_agent() {
   [ "$(uname)" = Darwin ] || die "install only supports macOS so far"
-  cmd=restore
-  [ "${1:-}" = --tabs ] && cmd="restore --tabs"
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   shell=${SHELL:-/bin/zsh}
-  mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
-  # Run through an interactive login shell so the background service, and every
-  # session it starts, gets the same environment as a terminal.
-  cat > "$PLIST" <<EOF
+  uid=$(id -u)
+  mkdir -p "$AGENTS" "$(dirname "$LOG")" "$STATE_DIR"
+  # Restore runs through an interactive login shell, so it finds claude and
+  # jq the way a terminal does.
+  cat > "$AGENTS/$LABEL.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -147,7 +181,7 @@ install_agent() {
   <array>
     <string>$shell</string>
     <string>-lic</string>
-    <string>exec '$self' $cmd</string>
+    <string>exec '$self' restore</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -158,31 +192,57 @@ install_agent() {
 </dict>
 </plist>
 EOF
-  plutil -lint "$PLIST" >/dev/null || die "wrote an invalid $PLIST"
-  echo "installed $PLIST"
-  echo "reborn $cmd will run at every login; log: $LOG"
+  cat > "$AGENTS/$SNAP_LABEL.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$SNAP_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$self</string>
+    <string>snapshot</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG</string>
+</dict>
+</plist>
+EOF
+  for p in "$AGENTS/$LABEL.plist" "$AGENTS/$SNAP_LABEL.plist"; do
+    plutil -lint "$p" >/dev/null || die "wrote an invalid $p"
+  done
+  # Start remembering tabs now rather than from the next login.
+  launchctl bootout "gui/$uid/$SNAP_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$uid" "$AGENTS/$SNAP_LABEL.plist"
+  "$self" snapshot
+  echo "installed: open Claude tabs are remembered every minute and reopened at login"
+  echo "log: $LOG"
 }
 
 uninstall_agent() {
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  rm -f "$PLIST"
-  echo "removed $PLIST"
+  uid=$(id -u)
+  for l in "$LABEL" "$SNAP_LABEL"; do
+    launchctl bootout "gui/$uid/$l" 2>/dev/null || true
+    rm -f "$AGENTS/$l.plist"
+  done
+  echo "removed both login items"
 }
 
 case ${1:-} in
-  restore)
-    shift; dry= tabs=
-    for arg in "$@"; do
-      case $arg in
-        --dry-run) dry=1 ;;
-        --tabs) tabs=1 ;;
-        *) usage >&2; exit 2 ;;
-      esac
-    done
-    restore ${dry:+--dry-run}
-    if [ -n "$tabs" ] && [ -z "$dry" ]; then sleep 2; open_tabs; fi ;;
-  tabs) shift; open_tabs "$@" ;;
-  install) shift; install_agent "$@" ;;
+  status) status ;;
+  restore) restore ;;
+  snapshot) snapshot ;;
+  install) install_agent ;;
   uninstall) uninstall_agent ;;
   --version) echo "reborn $VERSION" ;;
   -h|--help|help) usage ;;

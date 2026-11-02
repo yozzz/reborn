@@ -1,53 +1,38 @@
 # reborn
 
-Bring your Claude Code sessions back after a reboot.
+Reopen your Claude Code tabs after a restart.
 
-Claude Code can run sessions in the background (`claude --bg`) and keeps a list of the running ones. A reboot stops them, and the next time Claude's background service starts it clears that list. reborn reads the list at login, before anything else touches it, and resumes each session with `claude --bg --resume`. They come back idle, with the same ids and names. `claude attach <id>` opens one.
+Once a minute, reborn notes which Claude Code sessions are open in your terminal tabs. After a restart it opens one iTerm tab per session and continues each conversation where it left off. A tab you close is forgotten within a few minutes, so only what you actually had open comes back.
 
 ## Install
 
 ```sh
 git clone https://github.com/yozzz/reborn ~/reborn
 ln -s ~/reborn/bin/reborn ~/.local/bin/reborn   # any directory on your PATH
-reborn install                                  # resume sessions at every login
-# or: reborn install --tabs                     # ...and reopen each one as an iTerm tab
+reborn install
 ```
 
-Needs macOS, `jq` (built into recent macOS), and Claude Code with background sessions (tested with 2.1.316). Tabs need iTerm.
-
-## Start sessions in the background
-
-Only background sessions come back. Either start them with `claude --bg`, send a running one there with `/bg`, or make it the default:
-
-```sh
-echo 'source ~/reborn/shell/claude.zsh' >> ~/.zshrc
-```
-
-| Command | Does |
-|---|---|
-| `claude` | start a background session and open it |
-| Ctrl+Z | leave it, keep it running |
-| `claude attach` | go back to the session started in this tab |
-| `claude attach <id or name>` | open any session |
-| `claude agents` | list sessions |
-| `claude stop <id>` | end a session for good; it won't come back after a reboot |
+Needs macOS, iTerm, `jq` (built into recent macOS) and Claude Code (tested with 2.1.316).
 
 ## Commands
 
 | Command | Does |
 |---|---|
-| `reborn restore` | resume every session the roster lists that isn't running |
-| `reborn restore --dry-run` | show what would be resumed |
-| `reborn restore --tabs` | resume, then open each session in an iTerm tab |
-| `reborn tabs [id...]` | open every running background session, or just the ones given, as tabs in the current iTerm window |
-| `reborn install [--tabs]` | add a login item that runs `reborn restore`, or `reborn restore --tabs` (log: `~/Library/Logs/reborn.log`) |
-| `reborn uninstall` | remove the login item |
+| `reborn status` | show the Claude tabs that would come back after a restart |
+| `reborn restore` | reopen them in iTerm; runs at login (log: `~/Library/Logs/reborn.log`) |
+| `reborn snapshot` | note which Claude tabs are open; runs every minute |
+| `reborn install` | set up both login items |
+| `reborn uninstall` | remove them |
+
+## How it works
+
+Claude Code keeps a live list of its running sessions in `~/.claude/sessions/`. Every minute reborn copies the ones running in a terminal to `~/.local/state/reborn/open-tabs.tsv`. A session that disappears stays on the list for about 2½ minutes, because a shutdown closes every tab at once and the list has to survive that. At login, reborn opens an iTerm tab for each session from before the restart and runs `claude --resume <id>` in its folder.
+
+Tabs showing a background session with `claude attach <id>` are remembered too, and come back with `claude attach`.
 
 ## Limits
 
-- **It reads an internal file.** `~/.claude/daemon/roster.json` isn't a public API, and a Claude Code update could change it.
-- **Restore has to run first.** If you start a background session after a reboot before reborn runs, the list is gone. The conversations aren't: `claude --resume` still finds them.
-- **Untrusted folders are skipped.** Claude won't start a background session in a folder you haven't trusted. reborn logs it and moves on. Watch for new git repos: running `git init` inside a trusted folder makes the new repo untrusted, because Claude trusts each repo separately.
-- **Plain `claude` sessions aren't tracked** by Claude, so they can't be brought back. Use the shell function above.
-- **Tabs need permission.** The first time, macOS asks whether reborn may control iTerm. At login the request comes from the login item, so it may be shown as `zsh` or `osascript`. `reborn tabs` opens every running background session, including ones you already have open.
-- **Environment.** The login item runs your login shell (`$SHELL -lic`), so resumed sessions get the same environment as a terminal.
+- **It reads internal files.** `~/.claude/sessions/` and `~/.claude/daemon/roster.json` aren't a public API, and a Claude Code update could change them.
+- **Timing.** A tab closed in the last ~2 minutes before a restart may come back; one opened in the last minute may not.
+- **The agent view isn't tracked.** Claude doesn't record which session a `claude agents` tab is showing, so those tabs don't come back. For a background session you want kept, use `claude attach <id>`.
+- **Tabs need permission.** The first time, macOS asks whether reborn may control iTerm. At login the request may be shown as `zsh` or `osascript`.
