@@ -1,8 +1,8 @@
 #!/bin/sh
-# reborn: reopen your Claude Code tabs after a restart.
+# reborn: reopen your Claude Code tabs after a restart or an iTerm update.
 set -eu
 
-VERSION=0.3.1
+VERSION=0.4.0
 CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 ROSTER=$CONFIG_DIR/daemon/roster.json
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/reborn
@@ -22,7 +22,7 @@ die() { printf 'reborn: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<EOF
 usage: reborn status      show the Claude tabs that would come back after a restart
-       reborn restore     reopen them in iTerm (runs at login)
+       reborn restore     reopen them in iTerm (runs at login and when iTerm restarts)
        reborn snapshot    remember which Claude tabs are open (runs every minute)
        reborn install     set up both login items (macOS)
        reborn uninstall   remove them
@@ -44,6 +44,21 @@ running() {
 boot_time() {
   if [ -n "${REBORN_BOOT_TIME:-}" ]; then echo "$REBORN_BOOT_TIME"; return; fi
   sysctl -n kern.boottime | sed -E 's/^\{ sec = ([0-9]+),.*/\1/'
+}
+
+# When the running iTerm started, in seconds; nothing while iTerm isn't running.
+iterm_start() {
+  if [ -n "${REBORN_ITERM_START+set}" ]; then echo "$REBORN_ITERM_START"; return; fi
+  started=$(LC_ALL=C ps -axo lstart=,comm= | awk '/\.app\/Contents\/MacOS\/iTerm2$/ { print $1, $2, $3, $4, $5; exit }')
+  [ -z "$started" ] || LC_ALL=C date -j -f '%a %b %d %T %Y' "$started" +%s 2>/dev/null || boot_time
+}
+
+# Tabs last seen before this moment were open in an iTerm that has quit since,
+# for a restart or an update, and are due to come back. While iTerm isn't
+# running, all of them are.
+restart_time() {
+  started=$(iterm_start)
+  echo "${started:-$(date +%s)}"
 }
 
 service_running() {
@@ -74,19 +89,37 @@ current_sessions() {
   done
 }
 
+# Restore runs as its own login item, so it gets the login shell and the log it
+# has at login, and launchd never runs two at once.
+start_restore() {
+  uid=$(id -u)
+  launchctl kickstart "gui/$uid/$LABEL" >/dev/null 2>&1 \
+    || launchctl bootstrap "gui/$uid" "$AGENTS/$LABEL.plist" 2>/dev/null || true
+}
+
 # The list is: last seen, kind, session id, short id, folder, name.
 snapshot() {
   mkdir -p "$STATE_DIR"
   now=$(date +%s)
-  boot=$(boot_time)
+  started=$(iterm_start)
+  due=${started:-$now}
   tmp=$(mktemp "$STATE_DIR/.open.XXXXXX")
   {
     current_sessions | awk -v now="$now" 'BEGIN { FS = OFS = "\t" } { print now, $0 }'
     [ -f "$OPEN" ] && cat "$OPEN"
-  } | awk -v now="$now" -v boot="$boot" -v keep="$KEEP_SECONDS" 'BEGIN { FS = OFS = "\t" }
+  } | awk -v now="$now" -v due="$due" -v keep="$KEEP_SECONDS" 'BEGIN { FS = OFS = "\t" }
     seen[$3]++ { next }
-    $1 == now || $1 < boot || now - $1 < keep' > "$tmp"
+    $1 == now || $1 < due || now - $1 < keep' > "$tmp"
   mv "$tmp" "$OPEN"
+  # iTerm started since the last look, after an update for instance, and tabs
+  # from before are waiting. It gets a few seconds to reopen its own windows
+  # first, so their empty tabs can be used.
+  [ -n "$started" ] && [ $((now - started)) -ge 10 ] || return 0
+  [ "$started" != "$(cat "$STATE_DIR/iterm-start" 2>/dev/null || true)" ] || return 0
+  echo "$started" > "$STATE_DIR/iterm-start"
+  if awk -v due="$started" 'BEGIN { FS = "\t" } $1 < due { n++ } END { exit !n }' "$OPEN"; then
+    start_restore
+  fi
 }
 
 status() {
@@ -173,8 +206,8 @@ APPLESCRIPT
 restore() {
   echo "reborn restore $(date '+%Y-%m-%d %H:%M:%S')"
   [ -s "$OPEN" ] || { echo "no remembered tabs"; return 0; }
-  boot=$(boot_time)
-  todo=$(awk -v boot="$boot" 'BEGIN { FS = "\t" } $1 < boot' "$OPEN")
+  due=$(restart_time)
+  todo=$(awk -v due="$due" 'BEGIN { FS = "\t" } $1 < due' "$OPEN")
   [ -n "$todo" ] || { echo "nothing was open before this restart"; return 0; }
   open_now=$(current_sessions | cut -f2)
   set --
@@ -206,7 +239,7 @@ EOF
   # Handled; from here on the snapshot tracks what's open again.
   cp "$OPEN" "$STATE_DIR/last-restore.tsv"
   tmp=$(mktemp "$STATE_DIR/.open.XXXXXX")
-  awk -v boot="$boot" 'BEGIN { FS = OFS = "\t" } $1 >= boot' "$OPEN" > "$tmp"
+  awk -v due="$due" 'BEGIN { FS = OFS = "\t" } $1 >= due' "$OPEN" > "$tmp"
   mv "$tmp" "$OPEN"
 }
 
@@ -273,7 +306,7 @@ EOF
   launchctl bootout "gui/$uid/$SNAP_LABEL" 2>/dev/null || true
   launchctl bootstrap "gui/$uid" "$AGENTS/$SNAP_LABEL.plist"
   "$self" snapshot
-  echo "installed: open Claude tabs are remembered every minute and reopened at login"
+  echo "installed: open Claude tabs are remembered every minute and reopened at login and when iTerm restarts"
   echo "log: $LOG"
 }
 
